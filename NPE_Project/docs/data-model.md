@@ -203,4 +203,4 @@ NotificationRule (Postgres - Cached)
 
 ---
 
-Would you like to move on to refining the "Decision Logic / Classification Strategy" or the "Duplicate Prevention & Alert Fatigue" section next?
+What section of the solution would you like to review next? (If you are pasting text, making sure it's copied as "plain text" without formatting can help avoid those parsing errors).
