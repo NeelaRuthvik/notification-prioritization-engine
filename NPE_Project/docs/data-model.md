@@ -1,15 +1,18 @@
 ---
+# Data Model
 
-data_model:
-  entity_overview: |
-    NotificationEvent  --(1:1)-->  DecisionRecord
-                                      |
-                                      | references
-                                      v
-                                NotificationRule
-                                (version snapshotted at decision time)
+This document describes the core entities used in the Notification Prioritization Engine (NPE).
 
-    UserNotificationState (Redis, per-user TTL keys — referenced during evaluation)
+---
+
+# 1️⃣ Entity Overview
+
+```mermaid
+graph TD
+
+NotificationEvent -->|1:1| DecisionRecord
+DecisionRecord -->|references (version snapshotted at decision time)| NotificationRule
+DecisionRecord -. reads state .-> UserNotificationState[(UserNotificationState<br/>Redis - per-user TTL keys)]
 ---
 
 ## 1. NotificationEvent
