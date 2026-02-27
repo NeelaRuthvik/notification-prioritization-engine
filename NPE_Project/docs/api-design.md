@@ -1,11 +1,13 @@
+
 # API Design
 
 ## Overview
 
 The NPE exposes 5 REST endpoints. All endpoints:
-- Accept and return `application/json`
-- Authenticate via service-to-service **JWT** in `Authorization: Bearer <token>` header
-- Return standard error shape on failure: `{ "error": { "code": "...", "message": "..." } }`
+
+* Accept and return `application/json`
+* Authenticate via service-to-service **JWT** in `Authorization: Bearer <token>` header
+* Return standard error shape on failure: `{ "error": { "code": "...", "message": "..." } }`
 
 **Base URL:** `https://npe.internal/v1`
 
@@ -14,18 +16,18 @@ The NPE exposes 5 REST endpoints. All endpoints:
 ## Endpoint Index
 
 | # | Method | Path | Purpose |
-|---|--------|------|---------|
+| --- | --- | --- | --- |
 | 1 | POST | `/notifications/submit` | Submit a notification event; receive decision synchronously |
 | 2 | GET | `/notifications/decision/{event_id}` | Retrieve stored decision record (audit/support) |
-| 3 | GET | `/users/{user_id}/notification-state` | Get current user notification state |
-| 4 | PUT | `/rules/{rule_id}` | Create or update a routing rule |
+| 3 | GET | `/users/{user_id}/notification-state` | Get current user notification state and fatigue metrics |
+| 4 | PUT | `/rules/{rule_id}` | Create or update a routing rule dynamically |
 | 5 | POST | `/notifications/batch-status` | Poll delivery status for up to 100 event IDs |
 
 ---
 
 ## 1. POST `/notifications/submit`
 
-Submit a notification event to the engine. Returns the decision synchronously. Idempotent on `event_id`.
+Submit a notification event to the engine. Returns the decision synchronously. Strictly idempotent based on `event_id`.
 
 ### Request Body
 
@@ -47,12 +49,13 @@ Submit a notification event to the engine. Returns the decision synchronously. I
     "sender_id": "usr_xyz456"
   }
 }
+
 ```
 
 | Field | Required | Notes |
-|-------|----------|-------|
-| `event_id` | ✅ | UUID; caller-supplied for idempotency |
-| `user_id` | ✅ | Target user |
+| --- | --- | --- |
+| `event_id` | ✅ | UUID; caller-supplied for exact-match idempotency |
+| `user_id` | ✅ | Target user identifier |
 | `event_type` | ✅ | Enum: MESSAGE, REMINDER, ALERT, PROMO, SYSTEM, UPDATE, SECURITY |
 | `title` | ✅ | Max 120 chars |
 | `source` | ✅ | Originating service name |
@@ -61,65 +64,96 @@ Submit a notification event to the engine. Returns the decision synchronously. I
 | `message` | ❌ | Max 1000 chars |
 | `priority_hint` | ❌ | CRITICAL / HIGH / MEDIUM / LOW |
 | `expires_at` | ❌ | If past on receipt → immediate NEVER |
-| `dedupe_key` | ❌ | Caller hint; absent = canonical hash used |
+| `dedupe_key` | ❌ | Caller hint; if absent, a canonical text hash is generated for near-deduping |
 | `metadata` | ❌ | Arbitrary JSON ≤ 4KB |
 
 ### Responses
 
-**200 OK — Decision made**
+**200 OK — Decision made (Sent)**
+
 ```json
 {
   "event_id": "550e8400-e29b-41d4-a716-446655440000",
   "decision_id": "d1e2f3a4-...",
   "outcome": "NOW",
-  "reasons": ["DEFAULT_PASS"],
-  "score": 0.74,
+  "reasons": ["AI_PRIORITY_HIGH", "USER_ACTIVE"],
+  "matched_rule_id": null,
+  "score": 0.88,
   "defer_until": null,
   "ai_used": true,
   "decided_at": "2026-02-25T14:32:00.042Z"
 }
+
 ```
 
 **200 OK — Deferred**
+
 ```json
 {
   "event_id": "...",
   "decision_id": "...",
   "outcome": "LATER",
-  "reasons": ["QUIET_HOURS"],
+  "reasons": ["RULE_QUIET_HOURS"],
+  "matched_rule_id": "rule_abc123",
   "score": 0.61,
-  "defer_until": "2026-02-26T08:03:17Z",
-  "ai_used": true,
+  "defer_until": "2026-02-26T08:00:00Z",
+  "ai_used": false,
   "decided_at": "..."
 }
+
 ```
 
-**200 OK — Suppressed**
+**200 OK — Suppressed (Duplicate or Fatigue)**
+
 ```json
 {
   "event_id": "...",
   "decision_id": "...",
   "outcome": "NEVER",
-  "reasons": ["DEDUP_EXACT"],
-  "score": null,
+  "reasons": ["DEDUP_NEAR_MATCH"],
+  "matched_rule_id": null,
+  "score": 0.95,
   "defer_until": null,
-  "ai_used": false,
+  "ai_used": true,
   "decided_at": "..."
 }
+
 ```
 
-**409 Conflict — Already processed (idempotent replay)**
+**200 OK — Idempotent Replay**
+*(Returned when the exact `event_id` is submitted again. Prevents duplicate processing without throwing an error that might trigger upstream retries.)*
+
 ```json
 {
   "event_id": "...",
   "decision_id": "...",
   "outcome": "NOW",
-  "reasons": ["IDEMPOTENT_REPLAY"],
-  "message": "Event already processed; returning cached decision"
+  "reasons": ["IDEMPOTENT_CACHE_HIT"],
+  "is_replay": true,
+  "decided_at": "..." 
 }
+
+```
+
+**200 OK — Service Degraded / Fallback Mode Active**
+*(AI/Redis is down, but the system safely fell back to static rules. Returning 200 prevents upstream from retrying and worsening the load.)*
+
+```json
+{
+  "event_id": "...",
+  "decision_id": "...",
+  "outcome": "NOW",
+  "reasons": ["FALLBACK_DEFAULT_PASS"],
+  "score": null,
+  "fallback_mode": true,
+  "ai_used": false,
+  "decided_at": "..."
+}
+
 ```
 
 **422 Unprocessable Entity**
+
 ```json
 {
   "error": {
@@ -128,31 +162,19 @@ Submit a notification event to the engine. Returns the decision synchronously. I
     "fields": ["channel"]
   }
 }
-```
 
-**503 Service Degraded** *(fallback mode active)*
-```json
-{
-  "event_id": "...",
-  "decision_id": "...",
-  "outcome": "NOW",
-  "reasons": ["DEFAULT_PASS", "AI_FALLBACK", "REDIS_FALLBACK"],
-  "score": 0.50,
-  "fallback_mode": true,
-  "decided_at": "..."
-}
 ```
 
 ---
 
 ## 2. GET `/notifications/decision/{event_id}`
 
-Retrieve the stored decision record for a previously submitted event. Used for audit, support, and debugging.
+Retrieve the stored decision record for a previously submitted event. Used for audit, support, and debugging explainability.
 
 ### Path Parameters
 
 | Param | Type | Required |
-|-------|------|----------|
+| --- | --- | --- |
 | `event_id` | UUID | ✅ |
 
 ### Response 200
@@ -163,10 +185,10 @@ Retrieve the stored decision record for a previously submitted event. Used for a
   "event_id": "550e8400-...",
   "user_id": "usr_abc123",
   "outcome": "NOW",
-  "reasons": ["DEFAULT_PASS"],
-  "score": 0.74,
+  "reasons": ["AI_PRIORITY_HIGH", "USER_ACTIVE"],
+  "matched_rule_id": null,
+  "score": 0.88,
   "ai_used": true,
-  "ai_score": 0.82,
   "rule_version": "2.1.4",
   "defer_until": null,
   "defer_count": 0,
@@ -175,24 +197,28 @@ Retrieve the stored decision record for a previously submitted event. Used for a
   "delivery_channel": "push",
   "delivery_status": "DELIVERED"
 }
+
 ```
 
 **404 Not Found**
+
 ```json
 { "error": { "code": "NOT_FOUND", "message": "No decision found for event_id" } }
+
 ```
 
 ---
 
 ## 3. GET `/users/{user_id}/notification-state`
 
-Retrieve the current notification state for a user. Useful for support tooling, user-facing preference explanations, and debugging suppression behavior.
+Retrieve the current notification state for a user. Useful for support tooling, user-facing preference explanations, and debugging suppression/fatigue behavior.
 
 ### Response 200
 
 ```json
 {
   "user_id": "usr_abc123",
+  "fatigue_score": 0.85, 
   "window_counts": {
     "last_5m": 1,
     "last_1h": 7,
@@ -210,24 +236,25 @@ Retrieve the current notification state for a user. Useful for support tooling, 
       "expires_at": "2026-02-25T15:30:00Z"
     }
   ],
-  "incident_mode_active": false,
   "quiet_hours": {
     "enabled": true,
     "start": "22:00",
     "end": "08:00",
-    "timezone": "Asia/Kolkata"
+    "timezone": "Asia/Kolkata",
+    "is_currently_active": false
   },
   "opted_out_channels": ["sms"],
   "opted_out_event_types": ["PROMO"],
   "pending_deferred_count": 2
 }
+
 ```
 
 ---
 
 ## 4. PUT `/rules/{rule_id}`
 
-Create or update a notification routing rule. Changes take effect within 30 seconds (in-memory cache TTL refresh). **No deployment required.**
+Create or update a static notification routing rule. Changes take effect within 30 seconds (in-memory cache TTL refresh). **No code deployment required.**
 
 ### Request Body
 
@@ -251,10 +278,11 @@ Create or update a notification routing rule. Changes take effect within 30 seco
   },
   "enabled": true
 }
+
 ```
 
 | Field | Required | Notes |
-|-------|----------|-------|
+| --- | --- | --- |
 | `name` | ✅ | Human-readable label |
 | `priority` | ✅ | Unique integer; lower = evaluated first |
 | `conditions` | ✅ | JSONB predicate tree |
@@ -273,11 +301,13 @@ Create or update a notification routing rule. Changes take effect within 30 seco
   "enabled": true,
   "created_at": "2026-02-25T14:00:00Z",
   "updated_at": "2026-02-25T14:00:00Z",
-  "message": "Rule saved. Will take effect within 30 seconds."
+  "message": "Rule saved. Will take effect globally within 30 seconds."
 }
+
 ```
 
 **400 Bad Request**
+
 ```json
 {
   "error": {
@@ -286,9 +316,11 @@ Create or update a notification routing rule. Changes take effect within 30 seco
     "fields": ["conditions.rules[0].operator"]
   }
 }
+
 ```
 
 **409 Conflict** *(priority already taken)*
+
 ```json
 {
   "error": {
@@ -296,13 +328,14 @@ Create or update a notification routing rule. Changes take effect within 30 seco
     "message": "Priority 45 is already assigned to rule 'rule_xyz'. Choose a unique priority value."
   }
 }
+
 ```
 
 ---
 
 ## 5. POST `/notifications/batch-status`
 
-Poll delivery status and decision outcomes for up to 100 event IDs in a single call. Designed for dashboards, reporting, and bulk support lookups.
+Poll delivery status and decision outcomes for up to 100 event IDs in a single call. Designed for downstream service reconciliation, reporting, and bulk support lookups.
 
 ### Request Body
 
@@ -313,10 +346,11 @@ Poll delivery status and decision outcomes for up to 100 event IDs in a single c
     "661f9511-f30c-52e5-b827-557766551111"
   ]
 }
+
 ```
 
 | Field | Required | Constraints |
-|-------|----------|-------------|
+| --- | --- | --- |
 | `event_ids` | ✅ | Array of UUIDs; max 100 items |
 
 ### Response 200
@@ -329,7 +363,7 @@ Poll delivery status and decision outcomes for up to 100 event IDs in a single c
       "outcome": "NOW",
       "delivery_status": "DELIVERED",
       "delivered_at": "2026-02-25T14:32:00.119Z",
-      "reasons": ["DEFAULT_PASS"]
+      "reasons": ["AI_PRIORITY_HIGH"]
     },
     {
       "event_id": "661f9511-...",
@@ -342,21 +376,7 @@ Poll delivery status and decision outcomes for up to 100 event IDs in a single c
   "not_found": [],
   "total": 2
 }
+
 ```
 
 ---
-
-## Error Code Reference
-
-| HTTP Status | Code | Meaning |
-|-------------|------|---------|
-| 400 | `VALIDATION_FAILURE` | Request schema invalid |
-| 400 | `INVALID_RULE` | Rule conditions/action schema invalid |
-| 401 | `UNAUTHORIZED` | Missing or invalid JWT |
-| 403 | `FORBIDDEN` | Valid JWT but insufficient scope |
-| 404 | `NOT_FOUND` | Resource not found |
-| 409 | `DUPLICATE_EVENT` | Idempotent replay of already-processed event |
-| 409 | `PRIORITY_CONFLICT` | Rule priority number already in use |
-| 422 | `INVALID_ENUM` | Unrecognized enum value |
-| 429 | `RATE_LIMITED` | Ingestion rate limit exceeded |
-| 503 | `DEGRADED` | Fallback mode active; decision made with reduced accuracy |
