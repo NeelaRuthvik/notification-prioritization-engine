@@ -1,21 +1,15 @@
 ---
 
-# Data Model
+data_model:
+  entity_overview: |
+    NotificationEvent  --(1:1)-->  DecisionRecord
+                                      |
+                                      | references
+                                      v
+                                NotificationRule
+                                (version snapshotted at decision time)
 
-## Entity Overview
-
-```text
-NotificationEvent  ──(1:1)──▶  DecisionRecord
-                                     │
-                              (references)
-                                     │
-                                     ▼
-                               NotificationRule (used at decision time; version snapshotted)
-
-UserNotificationState  (Redis, per-user TTL keys — referenced during evaluation)
-
-```
-
+    UserNotificationState (Redis, per-user TTL keys — referenced during evaluation)
 ---
 
 ## 1. NotificationEvent
